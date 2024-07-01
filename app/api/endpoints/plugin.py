@@ -108,13 +108,19 @@ def install(plugin_id: str,
     """
     # 已安装插件
     install_plugins = SystemConfigOper().get(SystemConfigKey.UserInstalledPlugins) or []
-    # 如果是非本地括件，或者强制安装时，则需要下载安装
-    if repo_url and (force or plugin_id not in PluginManager().get_plugin_ids()):
-        # 下载安装
-        state, msg = PluginHelper().install(pid=plugin_id, repo_url=repo_url)
-        if not state:
-            # 安装失败
-            return schemas.Response(success=False, message=msg)
+    # 首先检查插件是否已经存在，并且是否强制安装，否则只进行安装统计
+    if not force and plugin_id in PluginManager().get_plugin_ids():
+        PluginHelper().install_reg(pid=plugin_id)
+    else:
+        # 插件不存在或需要强制安装，下载安装并注册插件
+        if repo_url:
+            state, msg = PluginHelper().install(pid=plugin_id, repo_url=repo_url)
+            # 安装失败则直接响应
+            if not state:
+                return schemas.Response(success=False, message=msg)
+        else:
+            # repo_url 为空时，也直接响应
+            return schemas.Response(success=False, message="没有传入仓库地址，无法正确安装插件，请检查配置")
     # 安装插件
     if plugin_id not in install_plugins:
         install_plugins.append(plugin_id)
@@ -176,13 +182,15 @@ def plugin_dashboard(plugin_id: str, key: str, user_agent: Annotated[str | None,
     return PluginManager().get_plugin_dashboard(plugin_id, key=key, user_agent=user_agent)
 
 
-@router.get("/reset/{plugin_id}", summary="重置插件配置", response_model=schemas.Response)
+@router.get("/reset/{plugin_id}", summary="重置插件配置及数据", response_model=schemas.Response)
 def reset_plugin(plugin_id: str, _: schemas.TokenPayload = Depends(verify_token)) -> Any:
     """
-    根据插件ID重置插件配置
+    根据插件ID重置插件配置及数据
     """
     # 删除配置
     PluginManager().delete_plugin_config(plugin_id)
+    # 删除插件所有数据
+    PluginManager().delete_plugin_data(plugin_id)
     # 重新生效插件
     PluginManager().init_plugin(plugin_id, {
         "enabled": False,

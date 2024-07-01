@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple, Set, Dict, Union
 
+from app import schemas
 from app.chain import ChainBase
 from app.core.config import settings
 from app.core.context import MediaInfo, TorrentInfo, Context
@@ -88,7 +89,8 @@ class DownloadChain(ChainBase):
             title=f"{mediainfo.title_year} "
                   f"{'%s %s' % (meta.season, download_episodes) if download_episodes else meta.season_episode} 开始下载",
             text=msg_text,
-            image=mediainfo.get_message_image()))
+            image=mediainfo.get_message_image(),
+            link=settings.MP_DOMAIN('/#/downloading')))
 
     def download_torrent(self, torrent: TorrentInfo,
                          channel: MessageChannel = None,
@@ -213,6 +215,13 @@ class DownloadChain(ChainBase):
         _torrent = context.torrent_info
         _media = context.media_info
         _meta = context.meta_info
+
+        # 补充完整的media数据
+        if not _media.genre_ids:
+            new_media = self.recognize_media(mtype=_media.type, tmdbid=_media.tmdb_id,
+                                             doubanid=_media.douban_id, bangumiid=_media.bangumi_id)
+            if new_media:
+                _media = new_media
 
         # 实际下载的集数
         download_episodes = StringUtils.format_ep(list(episodes)) if episodes else None
@@ -840,7 +849,9 @@ class DownloadChain(ChainBase):
                 channel=channel,
                 mtype=NotificationType.Download,
                 title="没有正在下载的任务！",
-                userid=userid))
+                userid=userid,
+                link=settings.MP_DOMAIN('#/downloading')
+            ))
             return
         # 发送消息
         title = f"共 {len(torrents)} 个任务正在下载："
@@ -852,8 +863,13 @@ class DownloadChain(ChainBase):
                             f"{round(torrent.progress, 1)}%")
             index += 1
         self.post_message(Notification(
-            channel=channel, mtype=NotificationType.Download,
-            title=title, text="\n".join(messages), userid=userid))
+            channel=channel,
+            mtype=NotificationType.Download,
+            title=title,
+            text="\n".join(messages),
+            userid=userid,
+            link=settings.MP_DOMAIN('#/downloading')
+        ))
 
     def downloading(self) -> List[DownloadingTorrent]:
         """
@@ -908,4 +924,14 @@ class DownloadChain(ChainBase):
         if not hash_str:
             return
         logger.warn(f"检测到下载源文件被删除，删除下载任务（不含文件）：{hash_str}")
-        self.remove_torrents(hashs=[hash_str], delete_file=False)
+        # 先查询种子
+        torrents: List[schemas.TransferTorrent] = self.list_torrents(hashs=[hash_str])
+        if torrents:
+            self.remove_torrents(hashs=[hash_str], delete_file=False)
+            # 发出下载任务删除事件，如需处理辅种，可监听该事件
+            self.eventmanager.send_event(EventType.DownloadDeleted, {
+                "hash": hash_str,
+                "torrents": [torrent.dict() for torrent in torrents]
+            })
+        else:
+            logger.info(f"没有在下载器中查询到 {hash_str} 对应的下载任务")
