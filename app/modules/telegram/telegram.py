@@ -1,5 +1,6 @@
 import re
 import threading
+import uuid
 from pathlib import Path
 from threading import Event
 from typing import Optional, List, Dict
@@ -67,13 +68,15 @@ class Telegram:
         """
         return self._bot is not None
 
-    def send_msg(self, title: str, text: str = "", image: str = "", userid: str = "") -> Optional[bool]:
+    def send_msg(self, title: str, text: str = "", image: str = "",
+                 userid: str = "", link: str = None) -> Optional[bool]:
         """
         发送Telegram消息
         :param title: 消息标题
         :param text: 消息内容
         :param image: 消息图片地址
         :param userid: 用户ID，如有则只发消息给该用户
+        :param link: 跳转链接
         :userid: 发送消息的目标用户ID，为空则发给管理员
         """
         if not self._telegram_token or not self._telegram_chat_id:
@@ -85,9 +88,14 @@ class Telegram:
 
         try:
             if text:
+                # 对text进行Markdown特殊字符转义
+                text = re.sub(r"([_`])", r"\\\1", text)
                 caption = f"*{title}*\n{text}"
             else:
                 caption = f"*{title}*"
+
+            if link:
+                caption = f"{caption}\n[查看详情]({link})"
 
             if userid:
                 chat_id = userid
@@ -100,7 +108,8 @@ class Telegram:
             logger.error(f"发送消息失败：{msg_e}")
             return False
 
-    def send_meidas_msg(self, medias: List[MediaInfo], userid: str = "", title: str = "") -> Optional[bool]:
+    def send_meidas_msg(self, medias: List[MediaInfo], userid: str = "",
+                        title: str = "", link: str = None) -> Optional[bool]:
         """
         发送媒体列表消息
         """
@@ -127,6 +136,9 @@ class Telegram:
                                                           f"类型：{media.type.value}")
                 index += 1
 
+            if link:
+                caption = f"{caption}\n[查看详情]({link})"
+
             if userid:
                 chat_id = userid
             else:
@@ -139,7 +151,7 @@ class Telegram:
             return False
 
     def send_torrents_msg(self, torrents: List[Context],
-                          userid: str = "", title: str = "") -> Optional[bool]:
+                          userid: str = "", title: str = "", link: str = None) -> Optional[bool]:
         """
         发送列表消息
         """
@@ -168,6 +180,9 @@ class Telegram:
                           f"{StringUtils.str_filesize(torrent.size)} {free} {seeder}"
                 index += 1
 
+            if link:
+                caption = f"{caption}\n[查看详情]({link})"
+
             if userid:
                 chat_id = userid
             else:
@@ -187,13 +202,15 @@ class Telegram:
         """
 
         if image:
-            req = RequestUtils(proxies=settings.PROXY).get_res(image)
-            if req is None:
+            res = RequestUtils(proxies=settings.PROXY).get_res(image)
+            if res is None:
                 raise Exception("获取图片失败")
-            if req.content:
-                image_file = Path(settings.TEMP_PATH) / Path(image).name
-                image_file.write_bytes(req.content)
+            if res.content:
+                # 使用随机标识构建图片文件的完整路径，并写入图片内容到文件
+                image_file = Path(settings.TEMP_PATH) / str(uuid.uuid4())
+                image_file.write_bytes(res.content)
                 photo = InputFile(image_file)
+                # 发送图片到Telegram
                 ret = self._bot.send_photo(chat_id=userid or self._telegram_chat_id,
                                            photo=photo,
                                            caption=caption,

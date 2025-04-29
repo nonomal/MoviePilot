@@ -20,7 +20,7 @@ class PluginHelper(metaclass=Singleton):
     插件市场管理，下载安装插件到本地
     """
 
-    _base_url = "https://raw.githubusercontent.com/%s/%s/main/"
+    _base_url = f"{settings.GITHUB_PROXY}https://raw.githubusercontent.com/%s/%s/main/"
 
     _install_reg = f"{settings.MP_SERVER_HOST}/plugin/install/%s"
 
@@ -35,6 +35,10 @@ class PluginHelper(metaclass=Singleton):
                 if self.install_report():
                     self.systemconfig.set(SystemConfigKey.PluginInstallReport, "1")
 
+    @property
+    def proxies(self):
+        return None if settings.GITHUB_PROXY else settings.PROXY
+
     @cached(cache=TTLCache(maxsize=1000, ttl=1800))
     def get_plugins(self, repo_url: str) -> Dict[str, dict]:
         """
@@ -47,7 +51,8 @@ class PluginHelper(metaclass=Singleton):
         if not user or not repo:
             return {}
         raw_url = self._base_url % (user, repo)
-        res = RequestUtils(proxies=settings.PROXY, headers=settings.GITHUB_HEADERS,
+        res = RequestUtils(proxies=self.proxies,
+                           headers=settings.REPO_GITHUB_HEADERS(repo=f"{user}/{repo}"),
                            timeout=10).get_res(f"{raw_url}package.json")
         if res:
             try:
@@ -133,12 +138,16 @@ class PluginHelper(metaclass=Singleton):
         if not user or not repo:
             return False, "不支持的插件仓库地址格式"
 
+        user_repo = f"{user}/{repo}"
+
         def __get_filelist(_p: str) -> Tuple[Optional[list], Optional[str]]:
             """
             获取插件的文件列表
             """
-            file_api = f"https://api.github.com/repos/{user}/{repo}/contents/plugins/{_p}"
-            r = RequestUtils(proxies=settings.PROXY, headers=settings.GITHUB_HEADERS, timeout=30).get_res(file_api)
+            file_api = f"https://api.github.com/repos/{user_repo}/contents/plugins/{_p}"
+            r = RequestUtils(proxies=settings.PROXY,
+                             headers=settings.REPO_GITHUB_HEADERS(repo=user_repo),
+                             timeout=30).get_res(file_api)
             if r is None:
                 return None, "连接仓库失败"
             elif r.status_code != 200:
@@ -157,9 +166,11 @@ class PluginHelper(metaclass=Singleton):
                 return False, "文件列表为空"
             for item in _l:
                 if item.get("download_url"):
+                    download_url = f"{settings.GITHUB_PROXY}{item.get('download_url')}"
                     # 下载插件文件
-                    res = RequestUtils(proxies=settings.PROXY,
-                                       headers=settings.GITHUB_HEADERS, timeout=60).get_res(item["download_url"])
+                    res = RequestUtils(proxies=self.proxies,
+                                       headers=settings.REPO_GITHUB_HEADERS(repo=user_repo),
+                                       timeout=60).get_res(download_url)
                     if not res:
                         return False, f"文件 {item.get('name')} 下载失败！"
                     elif res.status_code != 200:

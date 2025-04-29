@@ -2,7 +2,7 @@ import secrets
 import sys
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from pydantic import BaseSettings, validator
 
@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     """
     # 项目名称
     PROJECT_NAME = "MoviePilot"
+    # 域名 格式；https://movie-pilot.org
+    APP_DOMAIN: str = ""
     # API路径
     API_V1_STR: str = "/api/v1"
     # 前端资源路径
@@ -93,8 +95,8 @@ class Settings(BaseSettings):
     AUTH_SITE: str = ""
     # 交互搜索自动下载用户ID，使用,分割
     AUTO_DOWNLOAD_USER: Optional[str] = None
-    # 消息通知渠道 telegram/wechat/slack/synologychat/vocechat，多个通知渠道用,分隔
-    MESSAGER: str = "telegram"
+    # 消息通知渠道 telegram/wechat/slack/synologychat/vocechat/webpush，多个通知渠道用,分隔
+    MESSAGER: str = "webpush"
     # WeChat企业ID
     WECHAT_CORPID: Optional[str] = None
     # WeChat应用Secret
@@ -197,6 +199,8 @@ class Settings(BaseSettings):
     COOKIECLOUD_PASSWORD: Optional[str] = None
     # CookieCloud同步间隔（分钟）
     COOKIECLOUD_INTERVAL: Optional[int] = 60 * 24
+    # CookieCloud同步黑名单，多个域名,分割
+    COOKIECLOUD_BLACKLIST: Optional[str] = None
     # OCR服务器地址
     OCR_HOST: str = "https://movie-pilot.org"
     # CookieCloud对应的浏览器UA
@@ -220,12 +224,20 @@ class Settings(BaseSettings):
     PLUGIN_MARKET: str = "https://github.com/jxxghp/MoviePilot-Plugins,https://github.com/thsrite/MoviePilot-Plugins,https://github.com/honue/MoviePilot-Plugins,https://github.com/InfinityPacer/MoviePilot-Plugins"
     # Github token，提高请求api限流阈值 ghp_****
     GITHUB_TOKEN: Optional[str] = None
+    # 指定的仓库Github token，多个仓库使用,分隔，格式：{user1}/{repo1}:ghp_****,{user2}/{repo2}:github_pat_****
+    REPO_GITHUB_TOKEN: Optional[str] = None
+    # Github代理服务器，格式：https://mirror.ghproxy.com/
+    GITHUB_PROXY: Optional[str] = ''
     # 自动检查和更新站点资源包（站点索引、认证等）
     AUTO_UPDATE_RESOURCE: bool = True
     # 元数据识别缓存过期时间（小时）
     META_CACHE_EXPIRE: int = 0
     # 是否启用DOH解析域名
     DOH_ENABLE: bool = True
+    # 使用 DOH 解析的域名列表
+    DOH_DOMAINS: str = "api.themoviedb.org,api.tmdb.org,webservice.fanart.tv,api.github.com,github.com,raw.githubusercontent.com,api.telegram.org"
+    # DOH 解析服务器列表
+    DOH_RESOLVERS: str = "1.0.0.1,1.1.1.1,9.9.9.9,149.112.112.112"
     # 搜索多个名称
     SEARCH_MULTIPLE_NAME: bool = False
     # 订阅数据共享
@@ -300,7 +312,7 @@ class Settings(BaseSettings):
     @property
     def LOG_PATH(self):
         return self.CONFIG_PATH / "logs"
-    
+
     @property
     def COOKIE_PATH(self):
         return self.CONFIG_PATH / "cookies"
@@ -352,6 +364,37 @@ class Settings(BaseSettings):
             }
         return {}
 
+    def REPO_GITHUB_HEADERS(self, repo: str = None):
+        """
+        Github指定的仓库请求头
+        :param repo: 指定的仓库名称，格式为 "user/repo"。如果为空，或者没有找到指定仓库请求头，则返回默认的请求头信息
+        :return: Github请求头
+        """
+        # 如果没有传入指定的仓库名称，或没有配置指定的仓库Token，则返回默认的请求头信息
+        if not repo or not self.REPO_GITHUB_TOKEN:
+            return self.GITHUB_HEADERS
+        headers = {}
+        # 格式：{user1}/{repo1}:ghp_****,{user2}/{repo2}:github_pat_****
+        token_pairs = self.REPO_GITHUB_TOKEN.split(",")
+        for token_pair in token_pairs:
+            try:
+                parts = token_pair.split(":")
+                if len(parts) != 2:
+                    print(f"无效的令牌格式: {token_pair}")
+                    continue
+                repo_info = parts[0].strip()
+                token = parts[1].strip()
+                if not repo_info or not token:
+                    print(f"无效的令牌或仓库信息: {token_pair}")
+                    continue
+                headers[repo_info] = {
+                    "Authorization": f"Bearer {token}"
+                }
+            except Exception as e:
+                print(f"处理令牌对 '{token_pair}' 时出错: {e}")
+        # 如果传入了指定的仓库名称，则返回该仓库的请求头信息，否则返回默认请求头
+        return headers.get(repo, self.GITHUB_HEADERS)
+
     @property
     def DEFAULT_DOWNLOADER(self):
         """
@@ -359,7 +402,7 @@ class Settings(BaseSettings):
         """
         if not self.DOWNLOADER:
             return None
-        return self.DOWNLOADER.split(",")[0]
+        return next((d for d in settings.DOWNLOADER.split(",") if d), None)
 
     @property
     def DOWNLOADERS(self):
@@ -368,7 +411,25 @@ class Settings(BaseSettings):
         """
         if not self.DOWNLOADER:
             return []
-        return self.DOWNLOADER.split(",")
+        return [d for d in settings.DOWNLOADER.split(",") if d]
+
+    @property
+    def VAPID(self):
+        return {
+            "subject": f"mailto:{self.SUPERUSER}@movie-pilot.org",
+            "publicKey": "BH3w49sZA6jXUnE-yt4jO6VKh73lsdsvwoJ6Hx7fmPIDKoqGiUl2GEoZzy-iJfn4SfQQcx7yQdHf9RknwrL_lSM",
+            "privateKey": "JTixnYY0vEw97t9uukfO3UWKfHKJdT5kCQDiv3gu894"
+        }
+
+    def MP_DOMAIN(self, url: str = None):
+        if not self.APP_DOMAIN:
+            return None
+        domain = self.APP_DOMAIN.rstrip("/")
+        if not domain.startswith("http"):
+            domain = "http://" + domain
+        if not url:
+            return domain
+        return domain + "/" + url.lstrip("/")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -398,6 +459,8 @@ class GlobalVar(object):
     """
     # 系统停止事件
     STOP_EVENT: threading.Event = threading.Event()
+    # webpush订阅
+    SUBSCRIPTIONS: List[dict] = []
 
     def stop_system(self):
         """
@@ -410,6 +473,18 @@ class GlobalVar(object):
         是否停止
         """
         return self.STOP_EVENT.is_set()
+
+    def get_subscriptions(self):
+        """
+        获取webpush订阅
+        """
+        return self.SUBSCRIPTIONS
+
+    def push_subscription(self, subscription: dict):
+        """
+        添加webpush订阅
+        """
+        self.SUBSCRIPTIONS.append(subscription)
 
 
 # 实例化配置

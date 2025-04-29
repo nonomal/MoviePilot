@@ -18,10 +18,12 @@ from app.chain.tmdb import TmdbChain
 from app.chain.torrents import TorrentsChain
 from app.chain.transfer import TransferChain
 from app.core.config import settings
+from app.core.event import EventManager
 from app.core.plugin import PluginManager
 from app.helper.sites import SitesHelper
 from app.log import logger
 from app.schemas import Notification, NotificationType
+from app.schemas.types import EventType
 from app.utils.singleton import Singleton
 from app.utils.timer import TimerUtils
 
@@ -88,9 +90,14 @@ class Scheduler(metaclass=Singleton):
                     Notification(
                         mtype=NotificationType.Manual,
                         title="MoviePilot用户认证成功",
-                        text=f"使用站点：{msg}"
+                        text=f"使用站点：{msg}",
+                        link=settings.MP_DOMAIN('#/site')
                     )
                 )
+                PluginManager().init_config()
+                for plugin_id in PluginManager().get_running_plugin_ids():
+                    self.update_plugin_job(plugin_id)
+
             else:
                 self._auth_count += 1
                 logger.error(f"用户认证失败：{msg}，共失败 {self._auth_count} 次")
@@ -157,7 +164,7 @@ class Scheduler(metaclass=Singleton):
             },
             "random_wallpager": {
                 "name": "壁纸缓存",
-                "func": TmdbChain().get_random_wallpager,
+                "func": TmdbChain().get_trending_wallpapers,
                 "running": False,
             }
         }
@@ -370,6 +377,16 @@ class Scheduler(metaclass=Singleton):
             SchedulerChain().messagehelper.put(title=f"{job_name} 执行失败",
                                                message=str(e),
                                                role="system")
+            EventManager().send_event(
+                EventType.SystemError,
+                {
+                    "type": "scheduler",
+                    "scheduler_id": job_id,
+                    "scheduler_name": job_name,
+                    "error": str(e),
+                    "traceback": traceback.format_exc()
+                }
+            )
         # 运行结束
         with self._lock:
             try:
@@ -407,17 +424,17 @@ class Scheduler(metaclass=Singleton):
                             "plugin_name": plugin_name,
                             "running": False,
                         }
-                    self._scheduler.add_job(
-                        self.start,
-                        service["trigger"],
-                        id=sid,
-                        name=service["name"],
-                        **service["kwargs"],
-                        kwargs={
-                            'job_id': job_id
-                        }
-                    )
-                    logger.info(f"注册插件{plugin_name}服务：{service['name']} - {service['trigger']}")
+                        self._scheduler.add_job(
+                            self.start,
+                            service["trigger"],
+                            id=sid,
+                            name=service["name"],
+                            **service["kwargs"],
+                            kwargs={
+                                'job_id': job_id
+                            }
+                        )
+                        logger.info(f"注册插件{plugin_name}服务：{service['name']} - {service['trigger']}")
                 except Exception as e:
                     logger.error(f"注册插件{plugin_name}服务失败：{str(e)} - {service}")
                     SchedulerChain().messagehelper.put(title=f"插件 {plugin_name} 服务注册失败",

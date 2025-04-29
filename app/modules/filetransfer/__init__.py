@@ -77,11 +77,30 @@ class FileTransferModule(_ModuleBase):
                         break
                 if not link_ok:
                     return False, f"媒体库目录中未找到" \
-                                  f"与下载目录 {d_path} 在同一磁盘/存储空间/映射路径的目录，将无法硬链接"
+                                  f"与下载目录 {d_path.path} 在同一磁盘/存储空间/映射路径的目录，将无法硬链接"
         return True, ""
 
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
         pass
+
+    def recommend_name(self, meta: MetaBase, mediainfo: MediaInfo) -> Optional[str]:
+        """
+        获取重命名后的名称
+        :param meta: 元数据
+        :param mediainfo: 媒体信息
+        :return: 重命名后的名称（含目录）
+        """
+        # 重命名格式
+        rename_format = settings.TV_RENAME_FORMAT \
+            if mediainfo.type == MediaType.TV else settings.MOVIE_RENAME_FORMAT
+        # 获取重命名后的名称
+        path = self.get_rename_path(
+            template_string=rename_format,
+            rename_dict=self.__get_naming_dict(meta=meta,
+                                               mediainfo=mediainfo,
+                                               file_ext=Path(meta.title).suffix)
+        )
+        return str(path)
 
     def transfer(self, path: Path, meta: MetaBase, mediainfo: MediaInfo,
                  transfer_type: str, target: Path = None,
@@ -200,12 +219,13 @@ class FileTransferModule(_ModuleBase):
         """
         # 字幕正则式
         _zhcn_sub_re = r"([.\[(](((zh[-_])?(cn|ch[si]|sg|sc))|zho?" \
-                       r"|chinese|(cn|ch[si]|sg|zho?|eng)[-_&](cn|ch[si]|sg|zho?|eng)" \
+                       r"|chinese|(cn|ch[si]|sg|zho?|eng)[-_&]?(cn|ch[si]|sg|zho?|eng)" \
                        r"|简[体中]?)[.\])])" \
                        r"|([\u4e00-\u9fa5]{0,3}[中双][\u4e00-\u9fa5]{0,2}[字文语][\u4e00-\u9fa5]{0,3})" \
                        r"|简体|简中|JPSC" \
                        r"|(?<![a-z0-9])gb(?![a-z0-9])"
         _zhtw_sub_re = r"([.\[(](((zh[-_])?(hk|tw|cht|tc))" \
+                       r"|(cht|eng)[-_&]?(cht|eng)" \
                        r"|繁[体中]?)[.\])])" \
                        r"|繁体中[文字]|中[文字]繁体|繁体|JPTC" \
                        r"|(?<![a-z0-9])big5(?![a-z0-9])"
@@ -671,6 +691,10 @@ class FileTransferModule(_ModuleBase):
             "doubanid": mediainfo.douban_id,
             # 季号
             "season": meta.season_seq,
+            # 季年份根据season值获取
+            "season_year": mediainfo.season_years.get(
+                int(meta.season_seq),
+                None) if (mediainfo.season_years and meta.season_seq) else None,
             # 集号
             "episode": meta.episode_seqs,
             # 季集 SxxExx

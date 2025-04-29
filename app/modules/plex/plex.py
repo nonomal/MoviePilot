@@ -1,35 +1,31 @@
 import json
-from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple, Generator, Any
 from urllib.parse import quote_plus
 
+from cachetools import TTLCache, cached
 from plexapi import media
 from plexapi.server import PlexServer
+from requests import Response, Session
 
 from app import schemas
 from app.core.config import settings
 from app.log import logger
 from app.schemas import MediaType
+from app.utils.http import RequestUtils
 
 
 class Plex:
-
     _plex = None
+    _session = None
 
     def __init__(self):
         self._host = settings.PLEX_HOST
         if self._host:
-            if not self._host.endswith("/"):
-                self._host += "/"
-            if not self._host.startswith("http"):
-                self._host = "http://" + self._host
+            self._host = RequestUtils.standardize_base_url(self._host)
         self._playhost = settings.PLEX_PLAY_HOST
         if self._playhost:
-            if not self._playhost.endswith("/"):
-                self._playhost += "/"
-            if not self._playhost.startswith("http"):
-                self._playhost = "http://" + self._playhost
+            self._playhost = RequestUtils.standardize_base_url(self._playhost)
         self._token = settings.PLEX_TOKEN
         if self._host and self._token:
             try:
@@ -38,6 +34,7 @@ class Plex:
             except Exception as e:
                 self._plex = None
                 logger.error(f"Plex服务器连接失败：{str(e)}")
+            self._session = self.__adapt_plex_session()
 
     def is_inactive(self) -> bool:
         """
@@ -58,7 +55,7 @@ class Plex:
             self._plex = None
             logger.error(f"Plex服务器连接失败：{str(e)}")
 
-    @lru_cache(maxsize=10)
+    @cached(cache=TTLCache(maxsize=100, ttl=86400))
     def __get_library_images(self, library_key: str, mtype: int) -> Optional[List[str]]:
         """
         获取媒体服务器最近添加的媒体的图片列表
@@ -76,10 +73,11 @@ class Plex:
         # 如果总数不足,接续获取下一页
         while len(poster_urls) < total_size:
             items = self._plex.fetchItems(f"/hubs/home/recentlyAdded?type={mtype}&sectionID={library_key}",
-                                          container_size=total_size,
-                                          container_start=container_start)
+                                          container_start=container_start,
+                                          container_size=8,
+                                          maxresults=8)
             for item in items:
-                if item.type == 'episode':
+                if item.type == "episode":
                     # 如果是剧集的单集,则去找上级的图片
                     if item.parentThumb is not None:
                         poster_urls[item.parentThumb] = None
@@ -267,25 +265,59 @@ class Plex:
             season_episodes[episode.seasonNumber].append(episode.index)
         return videos.key, season_episodes
 
-    def get_remote_image_by_id(self, item_id: str, image_type: str) -> Optional[str]:
+    def get_remote_image_by_id(self, item_id: str, image_type: str, depth: int = 0) -> Optional[str]:
         """
         根据ItemId从Plex查询图片地址
-        :param item_id: 在Emby中的ID
+        :param item_id: 在Plex中的ID
         :param image_type: 图片的类型，Poster或者Backdrop等
+        :param depth: 当前递归深度，默认为0
         :return: 图片对应在TMDB中的URL
         """
-        if not self._plex:
+        if not self._plex or depth > 2 or not item_id:
             return None
         try:
-            if image_type == "Poster":
-                images = self._plex.fetchItems('/library/metadata/%s/posters' % item_id,
-                                               cls=media.Poster)
+            image_url = None
+            ekey = f"/library/metadata/{item_id}"
+            item = self._plex.fetchItem(ekey=ekey)
+            if not item:
+                return None
+            # 如果配置了外网播放地址以及Token，则默认从Plex媒体服务器获取图片，否则返回有外网地址的图片资源
+            if settings.PLEX_PLAY_HOST and settings.PLEX_TOKEN:
+                query = {"X-Plex-Token": settings.PLEX_TOKEN}
+                if image_type == "Poster":
+                    if item.thumb:
+                        image_url = RequestUtils.combine_url(host=settings.PLEX_PLAY_HOST, path=item.thumb, query=query)
+                else:
+                    # 默认使用art也就是Backdrop进行处理
+                    if item.art:
+                        image_url = RequestUtils.combine_url(host=settings.PLEX_PLAY_HOST, path=item.art, query=query)
+                    # 这里对episode进行特殊处理，实际上episode的Backdrop是Poster
+                    # 也有个别情况，比如机智的凡人小子episode就是Poster，因此这里把episode的优先级降低，默认还是取art
+                    if not image_url and item.TYPE == "episode" and item.thumb:
+                        image_url = RequestUtils.combine_url(host=settings.PLEX_PLAY_HOST, path=item.thumb, query=query)
             else:
-                images = self._plex.fetchItems('/library/metadata/%s/arts' % item_id,
-                                               cls=media.Art)
-            for image in images:
-                if hasattr(image, 'key') and image.key.startswith('http'):
-                    return image.key
+                if image_type == "Poster":
+                    images = self._plex.fetchItems(ekey=f"{ekey}/posters",
+                                                   cls=media.Poster)
+                else:
+                    # 默认使用art也就是Backdrop进行处理
+                    images = self._plex.fetchItems(ekey=f"{ekey}/arts",
+                                                   cls=media.Art)
+                    # 这里对episode进行特殊处理，实际上episode的Backdrop是Poster
+                    # 也有个别情况，比如机智的凡人小子episode就是Poster，因此这里把episode的优先级降低，默认还是取art
+                    if not images and item.TYPE == "episode":
+                        images = self._plex.fetchItems(ekey=f"{ekey}/posters",
+                                                       cls=media.Poster)
+                for image in images:
+                    if hasattr(image, "key") and image.key.startswith("http"):
+                        image_url = image.key
+                        break
+                # 如果最后还是找不到，则递归父级进行查找
+                if not image_url and hasattr(item, "parentRatingKey"):
+                    return self.get_remote_image_by_id(item_id=item.parentRatingKey,
+                                                       image_type=image_type,
+                                                       depth=depth + 1)
+            return image_url
         except Exception as e:
             logger.error(f"获取封面出错：" + str(e))
         return None
@@ -317,7 +349,7 @@ class Plex:
             # 否则一个一个刷新
             for path, lib_key in result_dict.items():
                 logger.info(f"刷新媒体库：{lib_key} - {path}")
-                self._plex.query(f'/library/sections/{lib_key}/refresh?path={quote_plus(path)}')
+                self._plex.query(f'/library/sections/{lib_key}/refresh?path={quote_plus(str(Path(path).parent))}')
 
     @staticmethod
     def __find_librarie(path: Path, libraries: List[Any]) -> Tuple[str, str]:
@@ -631,8 +663,12 @@ class Plex:
             return []
         # 媒体库白名单
         allow_library = ",".join([lib.id for lib in self.get_librarys()])
-        params = {'contentDirectoryID': allow_library}
-        items = self._plex.fetchItems("/hubs/continueWatching/items", container_start=0, container_size=num, params=params)
+        params = {"contentDirectoryID": allow_library}
+        items = self._plex.fetchItems("/hubs/continueWatching/items",
+                                      container_start=0,
+                                      container_size=num,
+                                      maxresults=num,
+                                      params=params)
         ret_resume = []
         for item in items:
             item_type = MediaType.MOVIE.value if item.TYPE == "movie" else MediaType.TV.value
@@ -723,3 +759,71 @@ class Plex:
                 ))
             offset += num
         return ret_resume[:num]
+
+    def get_data(self, endpoint: str, **kwargs) -> Optional[Response]:
+        """
+        自定义从媒体服务器获取数据
+        :param endpoint: 端点
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        """
+        return self.__request(method="get", endpoint=endpoint, **kwargs)
+
+    def post_data(self, endpoint: str, **kwargs) -> Optional[Response]:
+        """
+        自定义从媒体服务器获取数据
+        :param endpoint: 端点
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        """
+        return self.__request(method="post", endpoint=endpoint, **kwargs)
+
+    def put_data(self, endpoint: str, **kwargs) -> Optional[Response]:
+        """
+        自定义从媒体服务器获取数据
+        :param endpoint: 端点
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        """
+        return self.__request(method="put", endpoint=endpoint, **kwargs)
+
+    def __request(self, method: str, endpoint: str, **kwargs) -> Optional[Response]:
+        """
+        自定义从媒体服务器获取数据
+        :param method: HTTP方法，如 get, post, put 等
+        :param endpoint: 端点
+        :param kwargs: 其他请求参数，如headers, cookies, proxies等
+        """
+        if not self._session:
+            return
+        try:
+            url = RequestUtils.adapt_request_url(host=self._host, endpoint=endpoint)
+            kwargs.setdefault("headers", self.__get_request_headers())
+            kwargs.setdefault("raise_exception", True)
+            request_method = getattr(RequestUtils(session=self._session), f"{method}_res", None)
+            if request_method:
+                return request_method(url=url, **kwargs)
+            else:
+                logger.error(f"方法 {method} 不存在")
+                return None
+        except Exception as e:
+            logger.error(f"连接Plex出错：" + str(e))
+            return None
+
+    @staticmethod
+    def __get_request_headers() -> dict:
+        """获取请求头"""
+        return {
+            "X-Plex-Token": settings.PLEX_TOKEN,
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
+
+    @staticmethod
+    def __adapt_plex_session() -> Session:
+        """
+        创建并配置一个针对Plex服务的requests.Session实例
+        这个会话包括特定的头部信息，用于处理所有的Plex请求
+        """
+        # 设置请求头部，通常包括验证令牌和接受/内容类型头部
+        headers = Plex.__get_request_headers()
+        session = Session()
+        session.headers = headers
+        return session

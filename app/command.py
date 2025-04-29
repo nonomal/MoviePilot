@@ -1,3 +1,4 @@
+import copy
 import importlib
 import threading
 import traceback
@@ -11,8 +12,7 @@ from app.chain.subscribe import SubscribeChain
 from app.chain.system import SystemChain
 from app.chain.transfer import TransferChain
 from app.core.config import settings
-from app.core.event import Event as ManagerEvent
-from app.core.event import eventmanager, EventManager
+from app.core.event import Event as ManagerEvent, eventmanager, EventManager
 from app.core.plugin import PluginManager
 from app.helper.message import MessageHelper
 from app.helper.thread import ThreadHelper
@@ -194,7 +194,7 @@ class Command(metaclass=Singleton):
                             # 插件事件
                             self.threader.submit(
                                 self.pluginmanager.run_plugin_method,
-                                class_name, method_name, event
+                                class_name, method_name, copy.deepcopy(event)
                             )
 
                         else:
@@ -217,13 +217,23 @@ class Command(metaclass=Singleton):
                             if hasattr(class_obj, method_name):
                                 self.threader.submit(
                                     getattr(class_obj, method_name),
-                                    event
+                                    copy.deepcopy(event)
                                 )
                     except Exception as e:
                         logger.error(f"事件处理出错：{str(e)} - {traceback.format_exc()}")
                         self.messagehelper.put(title=f"{event.event_type} 事件处理出错",
                                                message=f"{class_name}.{method_name}：{str(e)}",
                                                role="system")
+                        self.eventmanager.send_event(
+                            EventType.SystemError,
+                            {
+                                "type": "event",
+                                "event_type": event.event_type,
+                                "event_handle": f"{class_name}.{method_name}",
+                                "error": str(e),
+                                "traceback": traceback.format_exc()
+                            }
+                        )
 
     def __run_command(self, command: Dict[str, any],
                       data_str: str = "",
@@ -263,6 +273,8 @@ class Command(metaclass=Singleton):
                     data = cmd_data.get("data") or {}
                     data['channel'] = channel
                     data['user'] = userid
+                    if data_str:
+                        data['args'] = data_str
                     cmd_data['data'] = data
                     command['func'](**cmd_data)
                 elif args_num == 2:

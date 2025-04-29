@@ -10,8 +10,7 @@ from ruamel.yaml import CommentedMap
 from transmission_rpc import File
 
 from app.core.config import settings
-from app.core.context import Context
-from app.core.context import MediaInfo, TorrentInfo
+from app.core.context import Context, MediaInfo, TorrentInfo
 from app.core.event import EventManager
 from app.core.meta import MetaBase
 from app.core.module import ModuleManager
@@ -79,6 +78,7 @@ class ChainBase(metaclass=ABCMeta):
     def run_module(self, method: str, *args, **kwargs) -> Any:
         """
         运行包含该方法的所有模块，然后返回结果
+        当kwargs包含命名参数raise_exception时，如模块方法抛出异常且raise_exception为True，则同步抛出异常
         """
 
         def is_result_empty(ret):
@@ -94,11 +94,12 @@ class ChainBase(metaclass=ABCMeta):
         result = None
         modules = self.modulemanager.get_running_modules(method)
         for module in modules:
+            module_id = module.__class__.__name__
             try:
                 module_name = module.get_name()
             except Exception as err:
                 logger.error(f"获取模块名称出错：{str(err)}")
-                module_name = module.__class__.__name__
+                module_name = module_id
             try:
                 func = getattr(module, method)
                 if is_result_empty(result):
@@ -116,11 +117,24 @@ class ChainBase(metaclass=ABCMeta):
                     # 中止继续执行
                     break
             except Exception as err:
+                if kwargs.get("raise_exception"):
+                    raise
                 logger.error(
-                    f"运行模块 {module.__class__.__name__}.{method} 出错：{str(err)}\n{traceback.format_exc()}")
+                    f"运行模块 {module_id}.{method} 出错：{str(err)}\n{traceback.format_exc()}")
                 self.messagehelper.put(title=f"{module_name}发生了错误",
                                        message=str(err),
                                        role="system")
+                self.eventmanager.send_event(
+                    EventType.SystemError,
+                    {
+                        "type": "module",
+                        "module_id": module_id,
+                        "module_name": module_name,
+                        "module_method": method,
+                        "error": str(err),
+                        "traceback": traceback.format_exc()
+                    }
+                )
         return result
 
     def recognize_media(self, meta: MetaBase = None,
@@ -130,7 +144,7 @@ class ChainBase(metaclass=ABCMeta):
                         bangumiid: int = None,
                         cache: bool = True) -> Optional[MediaInfo]:
         """
-        识别媒体信息
+        识别媒体信息，不含Fanart图片
         :param meta:     识别的元数据
         :param mtype:    识别的媒体类型，与tmdbid配套
         :param tmdbid:   tmdbid
@@ -154,7 +168,8 @@ class ChainBase(metaclass=ABCMeta):
                                tmdbid=tmdbid, doubanid=doubanid, bangumiid=bangumiid, cache=cache)
 
     def match_doubaninfo(self, name: str, imdbid: str = None,
-                         mtype: MediaType = None, year: str = None, season: int = None) -> Optional[dict]:
+                         mtype: MediaType = None, year: str = None, season: int = None,
+                         raise_exception: bool = False) -> Optional[dict]:
         """
         搜索和匹配豆瓣信息
         :param name: 标题
@@ -162,9 +177,10 @@ class ChainBase(metaclass=ABCMeta):
         :param mtype: 类型
         :param year: 年份
         :param season: 季
+        :param raise_exception: 触发速率限制时是否抛出异常
         """
         return self.run_module("match_doubaninfo", name=name, imdbid=imdbid,
-                               mtype=mtype, year=year, season=season)
+                               mtype=mtype, year=year, season=season, raise_exception=raise_exception)
 
     def match_tmdbinfo(self, name: str, mtype: MediaType = None,
                        year: str = None, season: int = None) -> Optional[dict]:
@@ -202,14 +218,15 @@ class ChainBase(metaclass=ABCMeta):
                                image_prefix=image_prefix, image_type=image_type,
                                season=season, episode=episode)
 
-    def douban_info(self, doubanid: str, mtype: MediaType = None) -> Optional[dict]:
+    def douban_info(self, doubanid: str, mtype: MediaType = None, raise_exception: bool = False) -> Optional[dict]:
         """
         获取豆瓣信息
         :param doubanid: 豆瓣ID
         :param mtype: 媒体类型
         :return: 豆瓣信息
+        :param raise_exception: 触发速率限制时是否抛出异常
         """
-        return self.run_module("douban_info", doubanid=doubanid, mtype=mtype)
+        return self.run_module("douban_info", doubanid=doubanid, mtype=mtype, raise_exception=raise_exception)
 
     def tvdb_info(self, tvdbid: int) -> Optional[dict]:
         """
@@ -219,14 +236,15 @@ class ChainBase(metaclass=ABCMeta):
         """
         return self.run_module("tvdb_info", tvdbid=tvdbid)
 
-    def tmdb_info(self, tmdbid: int, mtype: MediaType) -> Optional[dict]:
+    def tmdb_info(self, tmdbid: int, mtype: MediaType, season: int = None) -> Optional[dict]:
         """
         获取TMDB信息
         :param tmdbid: int
         :param mtype:  媒体类型
+        :param season: 季
         :return: TVDB信息
         """
-        return self.run_module("tmdb_info", tmdbid=tmdbid, mtype=mtype)
+        return self.run_module("tmdb_info", tmdbid=tmdbid, mtype=mtype, season=season)
 
     def bangumi_info(self, bangumiid: int) -> Optional[dict]:
         """
@@ -375,7 +393,7 @@ class ChainBase(metaclass=ABCMeta):
                                transfer_type=transfer_type, target=target, episodes_info=episodes_info,
                                scrape=scrape)
 
-    def transfer_completed(self, hashs: Union[str, list], path: Path = None,
+    def transfer_completed(self, hashs: str, path: Path = None,
                            downloader: str = settings.DEFAULT_DOWNLOADER) -> None:
         """
         转移完成后的处理
@@ -508,6 +526,14 @@ class ChainBase(metaclass=ABCMeta):
         """
         self.run_module("scrape_metadata", path=path, mediainfo=mediainfo, metainfo=metainfo,
                         transfer_type=transfer_type, force_nfo=force_nfo, force_img=force_img)
+
+    def metadata_img(self, mediainfo: MediaInfo, season: int = None) -> Optional[dict]:
+        """
+        获取图片名称和url
+        :param mediainfo: 媒体信息
+        :param season: 季号
+        """
+        return self.run_module("metadata_img", mediainfo=mediainfo, season=season)
 
     def media_category(self) -> Optional[Dict[str, list]]:
         """
